@@ -1,0 +1,342 @@
+#!/usr/bin/env sh
+
+root=${T2SAILD_ROOT:-/sys}
+poll_limit=${T2SAILD_POLL_LIMIT:-0}
+no_delay=${T2SAILD_NO_DELAY:-0}
+
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		-v | --verbose)
+			verbose=1
+			shift
+			;;
+		-V | --version)
+			printf '%s\n' 't2saild 0.1.0'
+			exit 0
+			;;
+		-h | --help)
+			printf '%s\n' \
+				'Usage: t2saild [-v|--verbose] [-V|--version] [-h|--help] MAX MIN [PROFILE BATPROFILE]' \
+				'' \
+				'Maintain battery charge between MIN and MAX.' \
+				'' \
+				'  -v, --verbose   Print record=poll min=<MIN> max=<MAX> limit=<LIMIT> target=<TARGET> capacity=<CAPACITY> state=<STATE> on each poll.' \
+				'  -V, --version   Print the version.' \
+				'  -h, --help      Print this help.'
+			exit 0
+			;;
+		-*)
+			printf 't2saild: unknown option: %s\n' "$1" >&2
+			exit 2
+			;;
+		*)
+			break
+			;;
+	esac
+done
+
+[ "${verbose:-0}" = 1 ] || verbose=0
+if [ "$#" -ne 2 ] && [ "$#" -ne 4 ]; then
+	printf '%s\n' 't2saild: expected MAX MIN [PROFILE BATPROFILE]' >&2
+	exit 2
+fi
+
+maximum=$1
+minimum=$2
+if [ "$#" -eq 2 ]; then
+	profile=performance
+	batprofile=powersave
+else
+	profile=$3
+	batprofile=$4
+fi
+
+if ! [ "$minimum" -ge 20 ] 2> /dev/null \
+	|| ! [ "$minimum" -lt "$maximum" ] 2> /dev/null \
+	|| ! [ "$maximum" -le 99 ] 2> /dev/null; then
+	printf '%s\n' 't2saild: MIN and MAX must satisfy 20 <= MIN < MAX <= 99' >&2
+	exit 2
+fi
+
+if [ -n "${T2SAILD_ROOT:-}" ]; then
+	root=$(CDPATH= cd -P "$root" 2> /dev/null && pwd -P) || {
+		printf '%s\n' 't2saild: cannot canonicalize T2SAILD_ROOT' >&2
+		exit 1
+	}
+fi
+
+if [ "$(id -u 2> /dev/null)" != 0 ] \
+	&& { [ -z "${T2SAILD_ROOT:-}" ] || [ "$root" = /sys ]; }; then
+	printf '%s\n' 't2saild: root privileges are required' >&2
+	exit 1
+fi
+
+sysfs_path=$(find "$root/devices" -name battery_charge_limit -print -quit 2> /dev/null)
+if [ -z "$sysfs_path" ]; then
+	printf '%s\n' 't2saild: no battery_charge_limit discovered' >&2
+	exit 1
+fi
+
+battery_path=
+for path in "$root"/class/power_supply/*; do
+	[ -d "$path" ] || continue
+	type=$(cat "$path/type" 2> /dev/null) || continue
+	if [ "$type" = Battery ]; then
+		battery_path=$path
+		break
+	fi
+done
+if [ -z "$battery_path" ]; then
+	printf '%s\n' 't2saild: no type=Battery power supply discovered' >&2
+	exit 1
+fi
+
+cpufreq_path=$root/devices/system/cpu/cpu0/cpufreq
+available_governors_path=$cpufreq_path/scaling_available_governors
+governor_path=$cpufreq_path/scaling_governor
+
+read_limit() {
+	limit=$(cat "$sysfs_path" 2> /dev/null) || {
+		printf 't2saild: cannot read current limit: %s\n' "$sysfs_path" >&2
+		return 1
+	}
+	case "$limit" in
+		'' | *[!0-9]*)
+			printf 't2saild: invalid current limit: %s\n' "$sysfs_path" >&2
+			return 1
+			;;
+	esac
+	if ! [ "$limit" -ge 0 ] 2> /dev/null \
+		|| ! [ "$limit" -le 100 ] 2> /dev/null; then
+		printf 't2saild: invalid current limit: %s\n' "$sysfs_path" >&2
+		return 1
+	fi
+}
+
+read_capacity() {
+	charge_now=$(cat "$battery_path/charge_now" 2> /dev/null) || {
+		printf 't2saild: cannot read capacity: %s\n' "$battery_path/charge_now" >&2
+		return 1
+	}
+	charge_full=$(cat "$battery_path/charge_full" 2> /dev/null) || {
+		printf 't2saild: cannot read capacity: %s\n' "$battery_path/charge_full" >&2
+		return 1
+	}
+	case "$charge_now" in
+		'' | *[!0-9]*)
+			printf 't2saild: invalid capacity: %s\n' "$battery_path/charge_now" >&2
+			return 1
+			;;
+	esac
+	case "$charge_full" in
+		'' | *[!0-9]*)
+			printf 't2saild: invalid capacity: %s\n' "$battery_path/charge_full" >&2
+			return 1
+			;;
+	esac
+	if ! [ "$charge_full" -gt 0 ] 2> /dev/null \
+		|| ! [ "$charge_now" -le "$charge_full" ] 2> /dev/null; then
+		printf 't2saild: invalid capacity: %s\n' "$battery_path" >&2
+		return 1
+	fi
+	capacity=$((100 * charge_now / charge_full))
+}
+
+read_status() {
+	status_line=$(cat "$battery_path/status" 2> /dev/null) || {
+		printf 't2saild: cannot read status: %s\n' "$battery_path/status" >&2
+		return 1
+	}
+	[ -n "$status_line" ] || {
+		printf 't2saild: empty status: %s\n' "$battery_path/status" >&2
+		return 1
+	}
+	if [ "$status_line" = Discharging ]; then
+		logged_state=discharging
+		if [ "$discharge_streak" -lt 5 ]; then
+			discharge_streak=$((discharge_streak + 1))
+		fi
+	else
+		discharge_streak=0
+		logged_state=$state
+	fi
+	if [ "$discharge_streak" -ge 5 ]; then
+		governor_target=$batprofile
+	else
+		governor_target=$profile
+	fi
+}
+
+read_governor() {
+	current_governor=$(cat "$governor_path" 2> /dev/null) || {
+		printf 't2saild: cannot read current governor: %s\n' "$governor_path" >&2
+		return 1
+	}
+	case "$current_governor" in
+		'' | *[![:graph:]]*)
+			printf 't2saild: invalid current governor: %s\n' "$governor_path" >&2
+			return 1
+			;;
+	esac
+}
+
+set_governor() {
+	read_governor || return 1
+	if [ "$current_governor" != "$governor_target" ]; then
+		printf 'record=setprofile from=%s target=%s streak=%s\n' \
+			"$current_governor" "$governor_target" "$discharge_streak"
+		if ! cpupower frequency-set -g "$governor_target"; then
+			printf '%s\n' 't2saild: governor command failed' >&2
+			return 1
+		fi
+		read_governor || return 1
+		if [ "$current_governor" != "$governor_target" ]; then
+			printf 't2saild: governor readback mismatch: %s\n' "$governor_path" >&2
+			return 1
+		fi
+	fi
+}
+
+write_limit() {
+	target=$1
+	if ! printf '%s\n' "$target" > "$sysfs_path"; then
+		printf 't2saild: BCLM write failed: %s\n' "$sysfs_path" >&2
+		return 1
+	fi
+	if ! read_limit; then
+		printf 't2saild: BCLM readback failed: %s\n' "$sysfs_path" >&2
+		return 1
+	fi
+	if [ "$limit" != "$target" ]; then
+		printf 't2saild: BCLM readback mismatch: %s\n' "$sysfs_path" >&2
+		return 1
+	fi
+}
+
+read_limit || exit 1
+read_capacity || exit 1
+
+if ! command -v cpupower > /dev/null 2>&1; then
+	printf '%s\n' 't2saild: cpupower is unavailable' >&2
+	exit 1
+fi
+
+available_governors=$(cat "$available_governors_path" 2> /dev/null) || {
+	printf 't2saild: cannot read available governors: %s\n' \
+		"$available_governors_path" >&2
+	exit 1
+}
+case "$available_governors" in
+	'' | *[![:graph:][:blank:]]*)
+		printf 't2saild: invalid available governors: %s\n' \
+			"$available_governors_path" >&2
+		exit 1
+		;;
+esac
+
+profile_found=0
+batprofile_found=0
+available_governors_found=0
+set -f
+for governor in $available_governors; do
+	available_governors_found=1
+	[ "$governor" = "$profile" ] && profile_found=1
+	[ "$governor" = "$batprofile" ] && batprofile_found=1
+done
+set +f
+if [ "$available_governors_found" -eq 0 ] \
+	|| [ "$profile_found" -ne 1 ] \
+	|| [ "$batprofile_found" -ne 1 ]; then
+	printf '%s\n' 't2saild: profile is not an available governor' >&2
+	exit 1
+fi
+read_governor || exit 1
+
+cleanup() {
+	status=$?
+	trap - EXIT INT TERM
+	if [ "$control_attempted" -eq 1 ]; then
+		if ! printf '%s\n' 100 > "$sysfs_path"; then
+			printf 't2saild: cleanup write failed: %s\n' "$sysfs_path" >&2
+			status=1
+		elif ! read_limit; then
+			printf 't2saild: cleanup readback failed: %s\n' "$sysfs_path" >&2
+			status=1
+		elif [ "$limit" != 100 ]; then
+			printf 't2saild: cleanup readback mismatch: %s\n' "$sysfs_path" >&2
+			status=1
+		else
+			printf 'record=cleanup target=100 limit=%s\n' "$limit"
+		fi
+	fi
+	exit "$status"
+}
+
+# SIGKILL cannot run cleanup.
+control_attempted=0
+trap cleanup EXIT
+trap 'exit 0' INT TERM
+
+if [ "$capacity" -lt "$maximum" ] 2> /dev/null; then
+	state=charging
+	target=$((maximum + 1))
+else
+	state=sailing
+	target=$((minimum - 1))
+fi
+
+discharge_streak=0
+control_attempted=1
+if ! write_limit "$target"; then
+	exit 1
+fi
+read_status || exit 1
+printf 'record=startup min=%s max=%s limit=%s target=%s capacity=%s state=%s\n' \
+	"$minimum" "$maximum" "$limit" "$target" "$capacity" "$logged_state"
+set_governor || exit 1
+
+poll_count=0
+while :; do
+	read_limit || exit 1
+	pre_limit=$limit
+	read_capacity || exit 1
+
+	transition=0
+	if [ "$state" = charging ] && [ "$capacity" -ge "$maximum" ] 2> /dev/null; then
+		from=$state
+		target=$((minimum - 1))
+		if ! write_limit "$target"; then
+			exit 1
+		fi
+		state=sailing
+		transition=1
+	elif [ "$state" = sailing ] && [ "$capacity" -lt "$minimum" ] 2> /dev/null; then
+		from=$state
+		target=$((maximum + 1))
+		if ! write_limit "$target"; then
+			exit 1
+		fi
+		state=charging
+		transition=1
+	fi
+	read_status || exit 1
+	if [ "$transition" -eq 1 ]; then
+		printf 'record=transition from=%s to=%s min=%s max=%s pre_limit=%s target=%s post_limit=%s capacity=%s state=%s\n' \
+			"$from" "$state" "$minimum" "$maximum" "$pre_limit" "$target" "$limit" \
+			"$capacity" "$logged_state"
+	fi
+	if [ "$verbose" -eq 1 ]; then
+		printf 'record=poll min=%s max=%s limit=%s target=%s capacity=%s state=%s\n' \
+			"$minimum" "$maximum" "$limit" "$target" "$capacity" "$logged_state"
+	fi
+	set_governor || exit 1
+
+	poll_count=$((poll_count + 1))
+	if [ "$poll_limit" -gt 0 ] 2> /dev/null \
+		&& [ "$poll_count" -ge "$poll_limit" ] 2> /dev/null; then
+		exit 0
+	fi
+	[ "$no_delay" = 1 ] || sleep 1
+done
+
+# vi: ft=sh

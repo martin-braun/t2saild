@@ -1,0 +1,8 @@
+# t2saild charges toward the configured maximum. Charging uses physical BCLM MAX+1; sailing uses physical BCLM MIN-1, while logical MIN remains the exclusive lower capacity threshold and charging stays disabled while AC remains connected. Capacity is the sensor: the current usable charge percentage derived per sample as 100 * charge_now / charge_full drives startup and charge-window transitions. BCLM is the actuator, and every write is validated by readback.
+# CPU governor profiles apply to regular status and exact Discharging status, respectively. Five consecutive exact Discharging samples select BATPROFILE; every other status immediately restores PROFILE.
+# Optional daemon arguments, such as t2saild_args="--verbose", precede MAX, MIN, PROFILE, and BATPROFILE.
+t2saild_min=77
+t2saild_max=83
+t2saild_profile=performance
+t2saild_batprofile=powersave
+t2saild_args=""

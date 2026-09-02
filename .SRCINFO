@@ -1,0 +1,22 @@
+pkgbase = t2saild
+	pkgdesc = Shell daemon for T2 Mac battery sail control with OpenRC service definition
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/martin-braun/t2saild
+	arch = x86_64
+	license = GPL3
+	depends = linux-t2
+	depends = findutils
+	depends = util-linux
+	depends = cpupower
+	backup = etc/conf.d/t2saild
+	source = t2saild
+	source = t2saild.initd
+	source = t2saild.confd
+	source = Makefile
+	sha256sums = SKIP
+	sha256sums = SKIP
+	sha256sums = SKIP
+	sha256sums = SKIP
+
+pkgname = t2saild

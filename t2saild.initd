@@ -1,0 +1,18 @@
+#!/sbin/openrc-run
+
+description="Apple T2 battery sailing daemon"
+command=/usr/bin/t2saild
+command_args="${t2saild_args} ${t2saild_max} ${t2saild_min} ${t2saild_profile} ${t2saild_batprofile}"
+supervisor="supervise-daemon"
+respawn_delay="2"
+respawn_max="5"
+respawn_period="60"
+supervise_daemon_args="--respawn-delay-step 2"
+retry="SIGTERM/5"
+output_logger="/usr/bin/logger -t t2saild -p daemon.info"
+error_logger="/usr/bin/logger -t t2saild -p daemon.err"
+
+depend() {
+	need localmount
+	use logger
+}
